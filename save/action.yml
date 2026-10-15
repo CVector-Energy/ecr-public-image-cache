@@ -1,0 +1,81 @@
+name: 'Save ECR Public images'
+description: >-
+  Pack container images into the Actions cache, so the next run loads them
+  instead of pulling them. Never fails the job. Pairs with the `restore`
+  action.
+
+# Belongs at the *end* of the job, so images pulled by later steps make it in too.
+#
+# Give it `if: ${{ !cancelled() && steps.<restore-id>.outputs.cache-hit != 'true' }}`: a job that failed still pulled images worth keeping, and an exact cache hit has nothing new to add. A prefix-match restore reports `cache-hit != 'true'`, which is what lets a changed key refresh the entry.
+
+inputs:
+  key:
+    description: >-
+      Key to write under. Pass the `cache-primary-key` output of the `restore`
+      step so the next run's exact-match restore finds it.
+    required: true
+  images:
+    description: >-
+      Whitespace-separated images to pack. Ones that are not present are left
+      out with a notice.
+    required: false
+    default: ''
+  pattern:
+    description: >-
+      Extended regular expression matched against the image of every container
+      the job created (`docker ps -a`); matching images are packed. Anchor it to
+      `name:tag`, for example `^public\.ecr\.aws/supabase/[^:]*:[^:]*$`.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Pack container images
+      id: pack
+      # The cache is an optimization; a failure to build it must never be the reason a run goes red.
+      continue-on-error: true
+      shell: bash
+      env:
+        IMAGE_TAR: ${{ runner.temp }}/ecr-public-image-cache/images.tar
+        IMAGES: ${{ inputs.images }}
+        PATTERN: ${{ inputs.pattern }}
+      run: |
+        set -euo pipefail
+
+        found=()
+        read -r -d '' -a listed <<< "$IMAGES" || true
+        for image in "${listed[@]}"; do
+          if docker image inspect "$image" >/dev/null 2>&1; then
+            found+=("$image")
+          else
+            echo "::notice::$image is not present; leaving it out of the cache."
+          fi
+        done
+
+        # Read the pattern's matches off the containers the job created rather than off `docker images`, so only images something actually ran get packed. That matters after a prefix-match restore: the previous entry's images are loaded and present, and packing everything present would carry every past generation forward into each new entry — a tar that grows without bound. `-a` keeps the one-shot containers that have already exited. `grep` matching nothing is the normal empty-set outcome rather than an error, hence the `|| true`.
+        if [ -n "$PATTERN" ]; then
+          mapfile -t matched < <(docker ps -a --format '{{.Image}}' | grep -E -- "$PATTERN" || true)
+          found+=("${matched[@]}")
+        fi
+
+        if [ "${#found[@]}" -eq 0 ]; then
+          echo "No images to cache."
+          exit 0
+        fi
+
+        mapfile -t images < <(printf '%s\n' "${found[@]}" | sort -u)
+        echo "Packing ${#images[@]} images:"
+        printf '  %s\n' "${images[@]}"
+        mkdir -p "$(dirname "$IMAGE_TAR")"
+        docker save --output "$IMAGE_TAR" "${images[@]}"
+        echo "packed=true" >> "$GITHUB_OUTPUT"
+
+    - name: Upload to the Actions cache
+      if: steps.pack.outputs.packed == 'true'
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        # Must match the path in `restore`: it is part of the cache version.
+        path: ${{ runner.temp }}/ecr-public-image-cache/images.tar
+        key: ${{ inputs.key }}
