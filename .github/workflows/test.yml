@@ -44,8 +44,9 @@ jobs:
           test "$CACHE_HIT" != 'true'
           docker image inspect "$IMAGE" >/dev/null
 
+      # No `--rm`: `save` finds pattern matches among the job's containers, and a removed container is not one.
       - name: Run a container
-        run: docker run --rm "$IMAGE" true
+        run: docker run "$IMAGE" true
 
       - name: Save images
         if: ${{ !cancelled() && steps.images.outputs.cache-hit != 'true' }}

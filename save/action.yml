@@ -25,6 +25,8 @@ inputs:
       Extended regular expression matched against the image of every container
       the job created (`docker ps -a`); matching images are packed. Anchor it to
       `name:tag`, for example `^public\.ecr\.aws/supabase/[^:]*:[^:]*$`.
+      Containers started with `docker run --rm` are gone by then, so list
+      their images in `images` instead.
     required: false
     default: ''
 

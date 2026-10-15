@@ -68,6 +68,6 @@ Outputs: `cache-hit`, `cache-matched-key`, `cache-primary-key`.
 |-------|-------------|---------|
 | `key` | Key to write under; pass `restore`'s `cache-primary-key`. | required |
 | `images` | Whitespace-separated images to pack. Missing ones are skipped with a notice. | `''` |
-| `pattern` | Extended regex matched against the images of the job's containers (`docker ps -a`). Anchor it to `name:tag`. | `''` |
+| `pattern` | Extended regex matched against the images of the job's containers (`docker ps -a`). Anchor it to `name:tag`. Containers run with `--rm` are gone by the end of the job; list their images in `images`. | `''` |
 
 Matching against containers rather than all local images keeps a prefix-match restore from carrying every previous generation of images forward into each new entry.
