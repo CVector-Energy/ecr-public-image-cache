@@ -1,0 +1,121 @@
+name: 'Restore ECR Public images'
+description: >-
+  Sign in to ECR Public with the job's AWS credentials, if it has any, then
+  load container images from the Actions cache and optionally pull the ones
+  still missing. Never fails the job. Pairs with the `save` action.
+
+# GitHub-hosted runners share egress IPs with other tenants, and anonymous public.ecr.aws pulls are throttled per source IP: a pull rate ("toomanyrequests: Rate exceeded") and a data quota ("toomanyrequests: Data limit exceeded"), either of which someone else's job can use up. Three defences, in order of how much they help:
+#
+#   1. Reuse images across runs via the Actions cache, so a warm job pulls nothing at all. This action restores the entry; `save` writes it at the end of the job.
+#   2. Sign in to ECR Public. Authenticated pulls get a much higher ceiling, budgeted per AWS account rather than per IP. The caller runs aws-actions/configure-aws-credentials first; the role needs `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken`.
+#   3. Retry. Both limits are bursty, so a second attempt after a pause usually gets through.
+
+inputs:
+  key:
+    description: >-
+      Cache key for this job's image set. Include whatever determines the image
+      tags, such as a tool version, so a change writes a new entry.
+    required: true
+  restore-keys:
+    description: >-
+      Newline-separated key prefixes to fall back to when `key` has no exact
+      match, as for actions/cache. An older entry still spares most of the
+      pulls, and `cache-hit` stays false so `save` refreshes it.
+    required: false
+    default: ''
+  images:
+    description: >-
+      Whitespace-separated images to pull, with retries, when the cache did not
+      supply them. Leave empty when a later step pulls its own images.
+    required: false
+    default: ''
+  sign-in:
+    description: 'Sign in to public.ecr.aws when the job has AWS credentials.'
+    required: false
+    default: 'true'
+
+outputs:
+  cache-hit:
+    description: >-
+      `true` when the restore found an exact match for `key`, meaning `save` has
+      nothing to add.
+    value: ${{ steps.cache.outputs.cache-hit }}
+  cache-matched-key:
+    description: 'Key of the entry that was restored, or empty when none was.'
+    value: ${{ steps.cache.outputs.cache-matched-key }}
+  cache-primary-key:
+    description: 'Key for `save` to write under.'
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Sign in to ECR Public
+      if: inputs.sign-in == 'true'
+      shell: bash
+      # Signing in raises the pull ceiling, but is not a hard requirement. Always exits 0.
+      run: |
+        set -uo pipefail
+
+        if ! aws sts get-caller-identity >/dev/null 2>&1; then
+          echo "::notice::No usable AWS credentials; pulling from ECR Public anonymously."
+          exit 0
+        fi
+
+        # ECR Public's authorization endpoint only exists in us-east-1, whatever region the rest of the job works in.
+        if aws ecr-public get-login-password --region us-east-1 \
+          | docker login --username AWS --password-stdin public.ecr.aws; then
+          echo 'Signed in to public.ecr.aws.'
+        else
+          echo "::warning::Could not sign in to ECR Public; falling back to anonymous pulls, which are rate-limited far more tightly. Check that the job's AWS role allows ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken."
+        fi
+        exit 0
+
+    - name: Restore container images
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        # `save` must name the same path: it is part of the cache version, so a different path never matches.
+        path: ${{ runner.temp }}/ecr-public-image-cache/images.tar
+        key: ${{ inputs.key }}
+        restore-keys: ${{ inputs.restore-keys }}
+
+    - name: Load cached container images
+      if: steps.cache.outputs.cache-matched-key != ''
+      # A truncated or otherwise unreadable entry should cost us the pulls it would have saved, not the run.
+      continue-on-error: true
+      shell: bash
+      env:
+        IMAGE_TAR: ${{ runner.temp }}/ecr-public-image-cache/images.tar
+      run: |
+        set -euo pipefail
+        docker load --input "$IMAGE_TAR"
+
+    - name: Pull missing container images
+      if: inputs.images != ''
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.images }}
+      # A failure here is only a warning: the step that needs the image will report the registry error itself if it still cannot get it. Always exits 0.
+      run: |
+        set -uo pipefail
+
+        read -r -d '' -a images <<< "$IMAGES" || true
+        for image in "${images[@]}"; do
+          if docker image inspect "$image" >/dev/null 2>&1; then
+            echo "$image is already present."
+            continue
+          fi
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Pulling $image failed on attempt ${attempt} of 3; retrying."
+              sleep $((attempt * 15))
+            else
+              echo "::warning::Could not pull $image after 3 attempts."
+            fi
+          done
+        done
+        exit 0
