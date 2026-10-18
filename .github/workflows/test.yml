@@ -1,0 +1,90 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: public.ecr.aws/docker/library/busybox:1.37
+  # One key per run, so the second job proves the first job's entry round-trips rather than finding an old one.
+  CACHE_KEY: ecr-public-image-cache-test-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  cold:
+    name: Cold cache
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # check out the repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No AWS credentials here, so this also exercises the anonymous fallback.
+      - name: Restore images
+        id: images
+        uses: ./restore
+        with:
+          key: ${{ env.CACHE_KEY }}
+          images: ${{ env.IMAGE }}
+
+      - name: Check the restore missed and the pull worked
+        env:
+          CACHE_HIT: ${{ steps.images.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$CACHE_HIT" != 'true'
+          docker image inspect "$IMAGE" >/dev/null
+
+      # No `--rm`: `save` finds pattern matches among the job's containers, and a removed container is not one.
+      - name: Run a container
+        run: docker run "$IMAGE" true
+
+      - name: Save images
+        if: ${{ !cancelled() && steps.images.outputs.cache-hit != 'true' }}
+        uses: ./save
+        with:
+          key: ${{ steps.images.outputs.cache-primary-key }}
+          pattern: '^public\.ecr\.aws/docker/library/busybox:[^:]*$'
+
+  warm:
+    name: Warm cache
+    needs: cold
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # check out the repository
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore images
+        id: images
+        uses: ./restore
+        with:
+          key: ${{ env.CACHE_KEY }}
+
+      - name: Check the image came from the cache
+        env:
+          CACHE_HIT: ${{ steps.images.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          test "$CACHE_HIT" = 'true'
+          docker image inspect "$IMAGE" >/dev/null
+
+      - name: Save with an explicit list skips missing images
+        uses: ./save
+        with:
+          key: ${{ env.CACHE_KEY }}-explicit
+          images: |
+            ${{ env.IMAGE }}
+            public.ecr.aws/docker/library/not-pulled:0
